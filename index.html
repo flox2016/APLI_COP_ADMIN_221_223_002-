@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>APLI COP — Admin</title>
+<title>APLI_COP_ADMIN_221_223_002-</title>
+<link rel="icon" type="image/png" href="COP.png">
 <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@900&family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
@@ -163,6 +164,9 @@ body{font-family:Poppins,sans-serif;background:#0D0D0D;color:#fff;min-height:100
   .sb-bottom{display:none;}
 }
 </style>
+  <!-- Firebase SDKs -->
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
 </head>
 <body>
 
@@ -430,25 +434,328 @@ body{font-family:Poppins,sans-serif;background:#0D0D0D;color:#fff;min-height:100
 </div>
 
 <script>
-// ── STORAGE (mismas claves que aplicop_full.html) ──────────────
-function lsGet(k){try{return JSON.parse(localStorage.getItem('ac_'+k));}catch(e){return null;}}
-function lsSet(k,v){localStorage.setItem('ac_'+k,JSON.stringify(v));}
-function getUsers(){return lsGet('users')||{};}
-function getCK(a,b){return [a,b].sort().join('|');}
-function getMsgs(a,b){return lsGet('msg_'+getCK(a,b))||[];}
-function saveMsgs(a,b,m){lsSet('msg_'+getCK(a,b),m);}
-function getAllPeds(){
-  var users=getUsers(); var all=[];
-  Object.keys(users).forEach(function(email){
-    var ps=lsGet('peds_'+email)||[];
-    ps.forEach(function(p){p._owner=email;p._ownerName=users[email].name||email.split('@')[0];});
-    all=all.concat(ps);
-  });
-  all.sort(function(a,b){return b.id-a.id;});
-  return all;
+// ══════════════════════════════════════════════════════════════
+// FIREBASE CONFIG — reemplazá con tu config real de Firebase
+// ══════════════════════════════════════════════════════════════
+var FB_CONFIG = {
+  apiKey:            "AIzaSyBjLIxqZOthNEKylx3e7xluhoEqXviiyOQ",
+  authDomain:        "apli-cop.firebaseapp.com",
+  projectId:         "apli-cop",
+  storageBucket:     "apli-cop.firebasestorage.app",
+  messagingSenderId: "427168042409",
+  appId:             "1:427168042409:web:c4129f30d3149e20ab08b8"
+};
+
+// ══════════════════════════════════════════════════════════════
+// FIREBASE INIT
+// ══════════════════════════════════════════════════════════════
+var FB = null;       // Firebase app
+var FS = null;       // Firestore
+var FB_READY = false;
+
+(function initFirebase(){
+  try {
+    if (typeof firebase === 'undefined') { console.warn('Firebase SDK no cargado'); return; }
+    if (!firebase.apps.length) firebase.initializeApp(FB_CONFIG);
+    FS = firebase.firestore();
+    FB_READY = true;
+    console.log('[APLI COP] Firebase conectado ✅');
+  } catch(e) {
+    console.warn('[APLI COP] Firebase no disponible, usando localStorage:', e.message);
+  }
+})();
+
+// ══════════════════════════════════════════════════════════════
+// STORAGE LAYER — Firestore primary, localStorage as cache/fallback
+// ══════════════════════════════════════════════════════════════
+
+// ── localStorage helpers (cache + fallback) ──────────────────
+function lsGet(k){ try{return JSON.parse(localStorage.getItem('ac_'+k));}catch(e){return null;} }
+function lsSet(k,v){ localStorage.setItem('ac_'+k, JSON.stringify(v)); }
+function lsDel(k){ localStorage.removeItem('ac_'+k); }
+
+// ── Firestore helpers ─────────────────────────────────────────
+function fsDoc(path){ 
+  // path like 'users/email' or 'pedidos/email/list/id'
+  var parts = path.split('/');
+  var ref = FS.collection(parts[0]);
+  for(var i=1; i<parts.length; i++){
+    if(i % 2 === 0) ref = ref.collection(parts[i]);
+    else ref = ref.doc(parts[i]);
+  }
+  return ref;
 }
-function savePedsFor(email,peds){lsSet('peds_'+email,peds);}
+
+function fsSet(collection, docId, data){
+  // Also update localStorage cache
+  lsSet(collection+'_'+docId, data);
+  if(!FB_READY) return Promise.resolve();
+  return FS.collection(collection).doc(docId).set(data, {merge:true})
+    .catch(function(e){ console.warn('fsSet error:', e); });
+}
+
+function fsGet(collection, docId){
+  if(!FB_READY) return Promise.resolve(lsGet(collection+'_'+docId));
+  return FS.collection(collection).doc(docId).get()
+    .then(function(doc){
+      var data = doc.exists ? doc.data() : null;
+      if(data) lsSet(collection+'_'+docId, data); // update cache
+      return data || lsGet(collection+'_'+docId);
+    })
+    .catch(function(){
+      return lsGet(collection+'_'+docId);
+    });
+}
+
+function fsGetAll(collection){
+  if(!FB_READY) return Promise.resolve([]);
+  return FS.collection(collection).get()
+    .then(function(snap){
+      return snap.docs.map(function(d){ return Object.assign({_id: d.id}, d.data()); });
+    })
+    .catch(function(){ return []; });
+}
+
+function fsDelete(collection, docId){
+  lsDel(collection+'_'+docId);
+  if(!FB_READY) return Promise.resolve();
+  return FS.collection(collection).doc(docId).delete()
+    .catch(function(e){ console.warn('fsDelete error:', e); });
+}
+
+// ── Real-time listener registry ───────────────────────────────
+var FS_LISTENERS = [];
+function fsListen(collection, docId, callback){
+  if(!FB_READY) return;
+  var unsub = FS.collection(collection).doc(docId)
+    .onSnapshot(function(doc){
+      if(doc.exists){
+        var data = doc.data();
+        lsSet(collection+'_'+docId, data);
+        callback(data);
+      }
+    }, function(e){ console.warn('fsListen error:', e); });
+  FS_LISTENERS.push(unsub);
+  return unsub;
+}
+
+function fsListenCollection(collection, callback, queryFn){
+  if(!FB_READY) return;
+  var ref = FS.collection(collection);
+  if(queryFn) ref = queryFn(ref);
+  var unsub = ref.onSnapshot(function(snap){
+    var docs = snap.docs.map(function(d){ return Object.assign({_id: d.id}, d.data()); });
+    callback(docs);
+  }, function(e){ console.warn('fsListenCollection error:', e); });
+  FS_LISTENERS.push(unsub);
+  return unsub;
+}
+
+function stopAllListeners(){
+  FS_LISTENERS.forEach(function(u){ try{ u(); }catch(e){} });
+  FS_LISTENERS = [];
+}
+
+// ── Email → safe Firestore doc ID ────────────────────────────
+function emailId(email){ return (email||'').replace(/\./g,'_').replace(/@/g,'__at__'); }
+function idToEmail(id){ return (id||'').replace(/__at__/g,'@').replace(/_/g,'.'); }
+
+// ══════════════════════════════════════════════════════════════
+// USER FUNCTIONS (Firestore-backed)
+// ══════════════════════════════════════════════════════════════
+function getUsers(){
+  // Returns cached users (always up-to-date via listeners)
+  return lsGet('users') || {};
+}
+function saveUsers(u){ 
+  lsSet('users', u);
+  // Individual user updates go through saveUser()
+}
+function saveUser(email, userData){
+  var users = getUsers();
+  users[email] = userData;
+  lsSet('users', users);
+  if(FB_READY) {
+    FS.collection('users').doc(emailId(email)).set(userData, {merge:true})
+      .catch(function(e){ console.warn('saveUser error:', e); });
+  }
+}
+
+function listenUsers(){
+  if(!FB_READY) return;
+  FS.collection('users').onSnapshot(function(snap){
+    var users = {};
+    snap.docs.forEach(function(d){
+      var email = idToEmail(d.id);
+      users[email] = d.data();
+    });
+    lsSet('users', users);
+  }, function(e){ console.warn('listenUsers error:', e); });
+}
+
+// ══════════════════════════════════════════════════════════════
+// PEDIDOS (Firestore-backed)
+// ══════════════════════════════════════════════════════════════
+function savePedidoFS(email, pedido){
+  if(!FB_READY) return;
+  var docId = emailId(email)+'_'+pedido.id;
+  FS.collection('pedidos').doc(docId).set(
+    Object.assign({}, pedido, {userEmail: email, _owner: email})
+  , {merge:true}).catch(function(e){ console.warn('savePedido error:', e); });
+}
+
+function deletePedidoFS(email, pedidoId){
+  if(!FB_READY) return;
+  var docId = emailId(email)+'_'+pedidoId;
+  FS.collection('pedidos').doc(docId).delete()
+    .catch(function(e){ console.warn('deletePedido error:', e); });
+}
+
+function listenPedidosUser(email, callback){
+  if(!FB_READY) return;
+  return FS.collection('pedidos')
+    .where('userEmail','==',email)
+    .onSnapshot(function(snap){
+      var peds = snap.docs.map(function(d){ return d.data(); });
+      peds.sort(function(a,b){ return b.id - a.id; });
+      lsSet('peds_'+email, peds);
+      callback(peds);
+    }, function(e){ console.warn('listenPedidos error:', e); });
+}
+
+function listenPedidosAdmin(callback){
+  if(!FB_READY) return;
+  return FS.collection('pedidos')
+    .onSnapshot(function(snap){
+      var peds = snap.docs.map(function(d){ return d.data(); });
+      peds.sort(function(a,b){ return b.id - a.id; });
+      callback(peds);
+    }, function(e){ console.warn('listenPedidosAdmin error:', e); });
+}
+
+// ══════════════════════════════════════════════════════════════
+// MESSAGES (Firestore-backed)
+// ══════════════════════════════════════════════════════════════
+function getChatKey(a,b){ return [a,b].sort().join('|'); }
+
+function getMsgs(a,b){ return lsGet('msg_'+getChatKey(a,b)) || []; }
+
+function saveMsgs(a,b,msgs){
+  var key = getChatKey(a,b);
+  lsSet('msg_'+key, msgs);
+  if(!FB_READY) return;
+  var safeKey = key.replace(/\./g,'_').replace(/@/g,'__at__').replace(/\|/g,'__pipe__');
+  FS.collection('chats').doc(safeKey).set({
+    messages: msgs,
+    updatedAt: Date.now(),
+    participants: [a, b]
+  }, {merge:true}).catch(function(e){ console.warn('saveMsgs error:', e); });
+}
+
+function listenMsgs(a, b, callback){
+  if(!FB_READY) return;
+  var key = getChatKey(a,b);
+  var safeKey = key.replace(/\./g,'_').replace(/@/g,'__at__').replace(/\|/g,'__pipe__');
+  return FS.collection('chats').doc(safeKey)
+    .onSnapshot(function(doc){
+      if(doc.exists){
+        var data = doc.data();
+        var msgs = data.messages || [];
+        lsSet('msg_'+key, msgs);
+        callback(msgs);
+      }
+    }, function(e){ console.warn('listenMsgs error:', e); });
+}
+
+// ══════════════════════════════════════════════════════════════
+// UPDATES/NOTIFS (Firestore-backed)
+// ══════════════════════════════════════════════════════════════
+function saveUpdate(update){
+  var updates = lsGet('updates') || [];
+  updates.unshift(update);
+  lsSet('updates', updates);
+  if(!FB_READY) return;
+  FS.collection('updates').doc(String(update.id)).set(update)
+    .catch(function(e){ console.warn('saveUpdate error:', e); });
+}
+
+function listenUpdates(callback){
+  if(!FB_READY) return;
+  return FS.collection('updates')
+    .orderBy('id','desc')
+    .limit(50)
+    .onSnapshot(function(snap){
+      var updates = snap.docs.map(function(d){ return d.data(); });
+      lsSet('updates', updates);
+      callback(updates);
+    }, function(e){ console.warn('listenUpdates error:', e); });
+}
+
+// ══════════════════════════════════════════════════════════════
+// BOT CONFIG (Firestore-backed)
+// ══════════════════════════════════════════════════════════════
+function saveBotConfig(key, value){
+  lsSet(key, value);
+  if(!FB_READY) return;
+  FS.collection('config').doc('bot').set(
+    (function(){ var o={}; o[key]=value; return o; })(),
+    {merge:true}
+  ).catch(function(e){ console.warn('saveBotConfig error:', e); });
+}
+
+function listenBotConfig(callback){
+  if(!FB_READY) return;
+  return FS.collection('config').doc('bot')
+    .onSnapshot(function(doc){
+      if(doc.exists){
+        var data = doc.data();
+        // Sync all bot config keys to localStorage
+        Object.keys(data).forEach(function(k){ lsSet(k, data[k]); });
+        callback(data);
+      }
+    }, function(e){ console.warn('listenBotConfig error:', e); });
+}
+
+// ══════════════════════════════════════════════════════════════
+// PRESENCE (online/offline)
+// ══════════════════════════════════════════════════════════════
+function setPresence(email, online){
+  if(!FB_READY) return;
+  FS.collection('presence').doc(emailId(email)).set({
+    online: online,
+    lastSeen: Date.now(),
+    email: email
+  }, {merge:true}).catch(function(e){ console.warn('presence error:', e); });
+}
+
+function listenPresence(callback){
+  if(!FB_READY) return;
+  return FS.collection('presence').onSnapshot(function(snap){
+    var presence = {};
+    snap.docs.forEach(function(d){
+      var email = idToEmail(d.id);
+      presence[email] = d.data();
+    });
+    callback(presence);
+  }, function(e){ console.warn('listenPresence error:', e); });
+}
+
+var _presence = {}; // cache
+
 var ADMIN='__admin__';
+
+// ── getAllPeds for admin — reads from Firestore cache ─────────
+var _allPedsCache = [];
+
+function getAllPeds(){
+  return _allPedsCache.length ? _allPedsCache : (lsGet('admin_all_peds')||[]);
+}
+
+function savePedsFor(email, peds){
+  lsSet('peds_'+email, peds);
+  if(FB_READY) peds.forEach(function(p){ savePedidoFS(email, p); });
+}
+
 
 // ── PIN ─────────────────────────────────────────────────────
 var pinVal='';
@@ -513,12 +820,13 @@ function showPanel(name,el){
 // ── REFRESH ─────────────────────────────────────────────────
 var currentChatUser=null;
 var pedsFilter='all';
+var _presence={};
 function refreshAll(){
   refreshDash(); refreshPeds(); refreshChatUsers(); refreshUsersTable(); refreshUpdates(); refreshBadges();
   if(currentChatUser) refreshAdminConvo();
 }
 function avColor(email){var c=['#FF6B00','#3A8FC7','#6B48FF','#E91E8C','#00897B','#F57C00'];var s=0;for(var i=0;i<email.length;i++)s+=email.charCodeAt(i);return c[s%c.length];}
-function isOnline(email){var u=getUsers()[email];return u&&u.online&&(Date.now()-(u.lastSeen||0))<30000;}
+function isOnline(email){if(_presence[email])return _presence[email].online&&(Date.now()-(_presence[email].lastSeen||0))<60000;var u=getUsers()[email];return u&&u.online&&(Date.now()-(u.lastSeen||0))<30000;}
 function nowT(){return new Date().toLocaleTimeString('es-AR',{hour:'2-digit',minute:'2-digit'});}
 function nowD(){return new Date().toLocaleDateString('es-AR');}
 
@@ -584,15 +892,29 @@ function pedAdminHTML(p){
     +'</div></div>';
 }
 function changeStatus(owner,id,newStatus){
-  var peds=lsGet('peds_'+owner)||[]; var p=peds.find(function(x){return x.id===id;}); if(!p)return;
-  p.status=newStatus; savePedsFor(owner,peds); toast('🔧','Estado actualizado'); refreshAll();
+  if(FB_READY){var docId=emailId(owner)+'_'+id;FS.collection('pedidos').doc(docId).set({status:newStatus},{merge:true}).catch(function(e){console.warn(e);});}
+  var p=_allPedsCache.find(function(x){return x.id===id;});if(p)p.status=newStatus;
+  var lsPeds=lsGet('peds_'+owner)||[];var lp=lsPeds.find(function(x){return x.id===id;});
+  if(lp){lp.status=newStatus;lsSet('peds_'+owner,lsPeds);}
+  toast('🔧','Estado actualizado');refreshAll();
 }
 function resolveFromAdmin(owner,id,ownerName,appName){
-  var peds=lsGet('peds_'+owner)||[]; var p=peds.find(function(x){return x.id===id;}); if(!p)return;
-  p.resolved=true; p.status='resolved'; savePedsFor(owner,peds);
+  // Update in Firestore directly
+  if(FB_READY){
+    var docId=emailId(owner)+'_'+id;
+    FS.collection('pedidos').doc(docId).set({resolved:true,status:'resolved'},{merge:true}).catch(function(e){console.warn(e);});
+  }
+  // Update local caches
+  var p=_allPedsCache.find(function(x){return x.id===id;});
+  if(p){p.resolved=true;p.status='resolved';}
+  var lsPeds=lsGet('peds_'+owner)||[];
+  var lp=lsPeds.find(function(x){return x.id===id;});
+  if(lp){lp.resolved=true;lp.status='resolved';lsSet('peds_'+owner,lsPeds);}
+  // Send chat message
   var msgs=getMsgs(ADMIN,owner);
   msgs.push({type:'text',text:'✅ ¡Hola '+ownerName+'! Tu pedido "'+appName+'" fue marcado como resuelto. Ya podés verlo en "Pedidos Resueltos" en tu app. ¡Gracias por confiar en APLI COP! 🚀',from:ADMIN,time:nowT()});
   saveMsgs(ADMIN,owner,msgs);
+  localStorage.setItem('admin_lr_'+owner,msgs.length);
   toast('✅','Pedido resuelto. Aviso enviado a '+ownerName);
   refreshAll();
 }
@@ -628,6 +950,12 @@ function openChatWithUser(email,name){
   var msgs=getMsgs(ADMIN,email);
   localStorage.setItem('admin_lr_'+email,msgs.length);
   showPanel('chat',document.querySelectorAll('.nav-link')[2]);
+  if(FB_READY){
+    listenMsgs(ADMIN,email,function(msgs){
+      localStorage.setItem('admin_lr_'+email,msgs.length);
+      if(currentChatUser===email)refreshAdminConvo();
+    });
+  }
   refreshAdminConvo();
 }
 function closeAdminConvo(){
@@ -653,16 +981,16 @@ function refreshAdminConvo(){
   c.scrollTop=c.scrollHeight;
 }
 function adminSendMsg(){
-  var input=document.getElementById('ac-input'); var text=input.value.trim();
-  if(!text||!currentChatUser) return;
+  var input=document.getElementById('ac-input');var text=input.value.trim();
+  if(!text||!currentChatUser)return;
   var msgs=getMsgs(ADMIN,currentChatUser);
   msgs.push({type:'text',text:text,from:ADMIN,time:nowT()});
   saveMsgs(ADMIN,currentChatUser,msgs);
   localStorage.setItem('admin_lr_'+currentChatUser,msgs.length);
-  input.value=''; refreshAdminConvo(); toast('💬','Mensaje enviado');
+  input.value='';refreshAdminConvo();toast('💬','Mensaje enviado');
 }
 function adminSendImg(event){
-  var file=event.target.files[0]; if(!file||!currentChatUser) return;
+  var file=event.target.files[0];if(!file||!currentChatUser)return;
   var r=new FileReader();
   r.onload=function(ev){
     var msgs=getMsgs(ADMIN,currentChatUser);
@@ -671,7 +999,7 @@ function adminSendImg(event){
     localStorage.setItem('admin_lr_'+currentChatUser,msgs.length);
     refreshAdminConvo();
   };
-  r.readAsDataURL(file); event.target.value='';
+  r.readAsDataURL(file);event.target.value='';
 }
 
 // ── USERS ───────────────────────────────────────────────────
@@ -695,11 +1023,10 @@ function publishUpdate(){
   var text=document.getElementById('upd-text').value.trim();
   if(!text){toast('❌','Escribí un mensaje primero');return;}
   var type=document.getElementById('upd-type').value;
-  var updates=lsGet('updates')||[];
-  updates.unshift({id:Date.now(),text:text,type:type,date:nowD(),time:nowT()});
-  lsSet('updates',updates);
+  var update={id:Date.now(),text:text,type:type,date:nowD(),time:nowT()};
+  saveUpdate(update);
   document.getElementById('upd-text').value='';
-  toast('📢','Actualización publicada para todos los usuarios');
+  toast('📢','✅ Actualización publicada para TODOS los usuarios');
   refreshUpdates();
 }
 function refreshUpdates(){
@@ -804,7 +1131,7 @@ function loadBotSettings(){
 function saveBotKey(){
   var key = document.getElementById('bot-api-key').value.trim();
   if(!key){ toast('❌','Ingresá una API key válida'); return; }
-  lsSet('bot_api_key', key);
+  saveBotConfig('bot_api_key', key);
   document.getElementById('bot-key-status').textContent = '✅ Key guardada';
   toast('✅','API Key guardada. El Bot la va a usar automáticamente.');
 }
@@ -837,18 +1164,18 @@ function testBotKey(){
 
 function saveBotModel(){
   var model = document.getElementById('bot-model').value;
-  lsSet('bot_model', model);
+  saveBotConfig('bot_model', model);
   toast('✅','Modelo guardado: '+model);
 }
 
 function saveBotInfo(){
   var info = document.getElementById('bot-extra-info').value.trim();
-  lsSet('bot_extra_info', info);
+  saveBotConfig('bot_extra_info', info);
   toast('✅','Información del bot guardada. Ya la usa al responder.');
 }
 
 function setTone(tone, el){
-  lsSet('bot_tone', tone);
+  saveBotConfig('bot_tone', tone);
   document.querySelectorAll('#tone-btns button').forEach(function(b){
     b.style.borderColor = '#2E2E2E';
     b.style.background  = 'none';
@@ -862,7 +1189,7 @@ function setTone(tone, el){
 
 function saveBotPersonality(){
   var extra = document.getElementById('bot-system-extra').value.trim();
-  lsSet('bot_system_extra', extra);
+  saveBotConfig('bot_system_extra', extra);
   toast('✅','Personalidad del bot guardada.');
 }
 
